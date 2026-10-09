@@ -40,6 +40,39 @@
 #include <thread>
 #include <vector>
 
+// s2t spike switches (attribute f32 drift vs mlx); env var set and != "0" enables
+static bool s2t_env(const char * name) {
+    const char * v = getenv(name);
+    return v && *v && *v != '0';
+}
+
+// WHISPER_S2T_PREC: request f32 staging of src1 on every mul_mat (honoured by the patched ggml-metal)
+static struct ggml_tensor * s2t_mul_mat(struct ggml_context * ctx, struct ggml_tensor * a, struct ggml_tensor * b) {
+    struct ggml_tensor * r = ggml_mul_mat(ctx, a, b);
+    if (s2t_env("WHISPER_S2T_PREC")) {
+        ggml_prec_set_src(r, GGML_PREC_F32, 1);
+    }
+    return r;
+}
+#define ggml_mul_mat(...) s2t_mul_mat(__VA_ARGS__)
+
+// WHISPER_S2T_GELU_ERF: exact erf GELU (as mlx/openai whisper) instead of ggml's tanh approximation
+static struct ggml_tensor * s2t_gelu(struct ggml_context * ctx, struct ggml_tensor * a) {
+    return s2t_env("WHISPER_S2T_GELU_ERF") ? ggml_gelu_erf(ctx, a) : ggml_gelu(ctx, a);
+}
+
+// WHISPER_S2T_CONV_F32: conv_1d_ph with an f32 im2col instead of ggml's hard-coded f16 one
+static struct ggml_tensor * s2t_conv_1d_ph(struct ggml_context * ctx, struct ggml_tensor * a, struct ggml_tensor * b, int s, int d) {
+    if (!s2t_env("WHISPER_S2T_CONV_F32")) {
+        return ggml_conv_1d_ph(ctx, a, b, s, d);
+    }
+    struct ggml_tensor * im2col = ggml_im2col(ctx, a, b, s, 0, a->ne[0] / 2, 0, d, 0, false, GGML_TYPE_F32);
+    struct ggml_tensor * r = ggml_mul_mat(ctx,
+            ggml_reshape_2d(ctx, im2col, im2col->ne[0], im2col->ne[2] * im2col->ne[1]),
+            ggml_reshape_2d(ctx, a, a->ne[0] * a->ne[1], a->ne[2]));
+    return ggml_reshape_3d(ctx, r, im2col->ne[1], a->ne[2], im2col->ne[2]);
+}
+
 #ifdef _MSC_VER
 #include <codecvt>
 #endif
@@ -1565,6 +1598,10 @@ static bool whisper_model_load(struct whisper_model_loader * loader, whisper_con
         // for the big tensors, we have the option to store the data in 16-bit floats or quantized
         // in order to save memory and also to speed up the computation
         wctx.wtype = ggml_ftype_to_ggml_type((ggml_ftype) (model.hparams.ftype));
+        // WHISPER_S2T_ITYPE_F32: f32 KV caches and attention casts instead of the hard-coded f16
+        if (s2t_env("WHISPER_S2T_ITYPE_F32")) {
+            wctx.itype = GGML_TYPE_F32;
+        }
         if (wctx.wtype == GGML_TYPE_COUNT) {
             WHISPER_LOG_ERROR("%s: invalid model (bad ftype value %d)\n", __func__, model.hparams.ftype);
             return false;
@@ -2045,15 +2082,15 @@ static struct ggml_cgraph * whisper_build_graph_conv(
     if (!whisper_encode_external(wstate)) {
         // convolution + gelu
         {
-            cur = ggml_conv_1d_ph(ctx0, model.e_conv_1_w, mel, 1, 1);
+            cur = s2t_conv_1d_ph(ctx0, model.e_conv_1_w, mel, 1, 1);
             cur = ggml_add(ctx0, cur, model.e_conv_1_b);
 
-            cur = ggml_gelu(ctx0, cur);
+            cur = s2t_gelu(ctx0, cur);
 
-            cur = ggml_conv_1d_ph(ctx0, model.e_conv_2_w, cur, 2, 1);
+            cur = s2t_conv_1d_ph(ctx0, model.e_conv_2_w, cur, 2, 1);
             cur = ggml_add(ctx0, cur, model.e_conv_2_b);
 
-            cur = ggml_gelu(ctx0, cur);
+            cur = s2t_gelu(ctx0, cur);
         }
 
         ggml_set_name(cur, "embd_conv");
@@ -2265,7 +2302,7 @@ static struct ggml_cgraph * whisper_build_graph_encoder(
             cur = ggml_add(ctx0, cur, layer.mlp_0_b);
 
             // GELU activation
-            cur = ggml_gelu(ctx0, cur);
+            cur = s2t_gelu(ctx0, cur);
 
             // projection
             cur = ggml_mul_mat(ctx0,
@@ -2846,7 +2883,7 @@ static struct ggml_cgraph * whisper_build_graph_decoder(
                     layer.mlp_0_b);
 
             // GELU activation
-            cur = ggml_gelu(ctx0, cur);
+            cur = s2t_gelu(ctx0, cur);
 
             // projection
             cur = ggml_mul_mat(ctx0,
