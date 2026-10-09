@@ -2048,12 +2048,12 @@ static struct ggml_cgraph * whisper_build_graph_conv(
             cur = ggml_conv_1d_ph(ctx0, model.e_conv_1_w, mel, 1, 1);
             cur = ggml_add(ctx0, cur, model.e_conv_1_b);
 
-            cur = ggml_gelu(ctx0, cur);
+            cur = ggml_gelu_erf(ctx0, cur);
 
             cur = ggml_conv_1d_ph(ctx0, model.e_conv_2_w, cur, 2, 1);
             cur = ggml_add(ctx0, cur, model.e_conv_2_b);
 
-            cur = ggml_gelu(ctx0, cur);
+            cur = ggml_gelu_erf(ctx0, cur);
         }
 
         ggml_set_name(cur, "embd_conv");
@@ -2265,7 +2265,7 @@ static struct ggml_cgraph * whisper_build_graph_encoder(
             cur = ggml_add(ctx0, cur, layer.mlp_0_b);
 
             // GELU activation
-            cur = ggml_gelu(ctx0, cur);
+            cur = ggml_gelu_erf(ctx0, cur);
 
             // projection
             cur = ggml_mul_mat(ctx0,
@@ -2846,7 +2846,7 @@ static struct ggml_cgraph * whisper_build_graph_decoder(
                     layer.mlp_0_b);
 
             // GELU activation
-            cur = ggml_gelu(ctx0, cur);
+            cur = ggml_gelu_erf(ctx0, cur);
 
             // projection
             cur = ggml_mul_mat(ctx0,
