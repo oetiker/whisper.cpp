@@ -44,6 +44,27 @@
 #include <codecvt>
 #endif
 
+// s2t: f32 precision in the whisper graph (the swiss2text fixtures are f32 mlx references)
+
+// every mul_mat of the whisper graph asks for src1 in f32: ggml-metal then runs an f32 x f32 product
+// as mul_mm_f32_f32_prec instead of staging both operands through half (the CPU backend ignores it)
+static struct ggml_tensor * s2t_mul_mat(struct ggml_context * ctx, struct ggml_tensor * a, struct ggml_tensor * b) {
+    struct ggml_tensor * r = ggml_mul_mat(ctx, a, b);
+    ggml_prec_set_src(r, GGML_PREC_F32, 1);
+    return r;
+}
+
+// ggml_conv_1d_ph with an f32 im2col in place of ggml_conv_1d's hard-coded f16 one; an f16 kernel is
+// cast to f32 because the backends take src1 of a mul_mat in f32 only
+static struct ggml_tensor * s2t_conv_1d_ph(struct ggml_context * ctx, struct ggml_tensor * a, struct ggml_tensor * b, int s, int d) {
+    struct ggml_tensor * im2col = ggml_im2col(ctx, a, b, s, 0, a->ne[0] / 2, 0, d, 0, false, GGML_TYPE_F32); // [N, OL, IC * K]
+    struct ggml_tensor * kernel = a->type == GGML_TYPE_F32 ? a : ggml_cast(ctx, a, GGML_TYPE_F32);
+    struct ggml_tensor * r = s2t_mul_mat(ctx,
+            ggml_reshape_2d(ctx, im2col, im2col->ne[0], im2col->ne[2] * im2col->ne[1]), // [N*OL, IC * K]
+            ggml_reshape_2d(ctx, kernel, a->ne[0] * a->ne[1], a->ne[2]));                 // [OC, IC * K]
+    return ggml_reshape_3d(ctx, r, im2col->ne[1], a->ne[2], im2col->ne[2]); // [N, OC, OL]
+}
+
 #if defined(WHISPER_BIG_ENDIAN)
 template<typename T>
 static T byteswap(T value) {
@@ -956,7 +977,7 @@ struct whisper_context {
     int64_t t_start_us = 0;
 
     ggml_type wtype = ggml_type::GGML_TYPE_F16; // weight type (FP32 / FP16 / QX)
-    ggml_type itype = ggml_type::GGML_TYPE_F16; // intermediate type (FP32 or FP16)
+    ggml_type itype = ggml_type::GGML_TYPE_F32; // intermediate type (FP32 or FP16); s2t: f32 KV caches and attention casts
 
     whisper_context_params params;
 
@@ -2050,12 +2071,12 @@ static struct ggml_cgraph * whisper_build_graph_conv(
     if (!whisper_encode_external(wstate)) {
         // convolution + gelu
         {
-            cur = ggml_conv_1d_ph(ctx0, model.e_conv_1_w, mel, 1, 1);
+            cur = s2t_conv_1d_ph(ctx0, model.e_conv_1_w, mel, 1, 1);
             cur = ggml_add(ctx0, cur, model.e_conv_1_b);
 
             cur = ggml_gelu_erf(ctx0, cur);
 
-            cur = ggml_conv_1d_ph(ctx0, model.e_conv_2_w, cur, 2, 1);
+            cur = s2t_conv_1d_ph(ctx0, model.e_conv_2_w, cur, 2, 1);
             cur = ggml_add(ctx0, cur, model.e_conv_2_b);
 
             cur = ggml_gelu_erf(ctx0, cur);
@@ -2157,7 +2178,7 @@ static struct ggml_cgraph * whisper_build_graph_encoder(
 
         // self-attention
         {
-            struct ggml_tensor * Qcur = ggml_mul_mat(ctx0,
+            struct ggml_tensor * Qcur = s2t_mul_mat(ctx0,
                     layer.attn_q_w,
                     cur);
 
@@ -2166,13 +2187,13 @@ static struct ggml_cgraph * whisper_build_graph_encoder(
             //Qcur = ggml_scale(ctx0, Qcur, pow(float(n_state_head), -0.25));
 
             // note: no bias for Key
-            struct ggml_tensor * Kcur = ggml_mul_mat(ctx0,
+            struct ggml_tensor * Kcur = s2t_mul_mat(ctx0,
                     layer.attn_k_w,
                     cur);
 
             //Kcur = ggml_scale(ctx0, Kcur, pow(float(n_state_head), -0.25));
 
-            struct ggml_tensor * Vcur = ggml_mul_mat(ctx0,
+            struct ggml_tensor * Vcur = s2t_mul_mat(ctx0,
                     layer.attn_v_w,
                     cur);
 
@@ -2215,7 +2236,7 @@ static struct ggml_cgraph * whisper_build_graph_encoder(
                             0, 2, 1, 3);
 
                 // K * Q
-                struct ggml_tensor * KQ = ggml_mul_mat(ctx0, K, Q);
+                struct ggml_tensor * KQ = s2t_mul_mat(ctx0, K, Q);
 
                 struct ggml_tensor * KQ_soft_max = ggml_soft_max_ext(ctx0, KQ, nullptr, KQscale, 0.0f);
 
@@ -2228,7 +2249,7 @@ static struct ggml_cgraph * whisper_build_graph_encoder(
                                 1, 2, 0, 3),
                             wctx.itype);
 
-                struct ggml_tensor * KQV = ggml_mul_mat(ctx0, V, KQ_soft_max);
+                struct ggml_tensor * KQV = s2t_mul_mat(ctx0, V, KQ_soft_max);
 
                 struct ggml_tensor * KQV_merged = ggml_permute(ctx0, KQV, 0, 2, 1, 3);
 
@@ -2238,7 +2259,7 @@ static struct ggml_cgraph * whisper_build_graph_encoder(
 
         // projection
         {
-            cur = ggml_mul_mat(ctx0,
+            cur = s2t_mul_mat(ctx0,
                     layer.attn_ln_1_w,
                     cur);
 
@@ -2263,7 +2284,7 @@ static struct ggml_cgraph * whisper_build_graph_encoder(
             }
 
             // fully connected
-            cur = ggml_mul_mat(ctx0,
+            cur = s2t_mul_mat(ctx0,
                     layer.mlp_0_w,
                     cur);
 
@@ -2273,7 +2294,7 @@ static struct ggml_cgraph * whisper_build_graph_encoder(
             cur = ggml_gelu_erf(ctx0, cur);
 
             // projection
-            cur = ggml_mul_mat(ctx0,
+            cur = s2t_mul_mat(ctx0,
                     layer.mlp_1_w,
                     cur);
 
@@ -2347,7 +2368,7 @@ static struct ggml_cgraph * whisper_build_graph_cross(
     for (int il = 0; il < model.hparams.n_text_layer; ++il) {
         auto & layer = model.layers_decoder[il];
 
-        struct ggml_tensor * Kcross = ggml_mul_mat(ctx0,
+        struct ggml_tensor * Kcross = s2t_mul_mat(ctx0,
                 layer.cross_attn_k_w,
                 cur);
 
@@ -2355,7 +2376,7 @@ static struct ggml_cgraph * whisper_build_graph_cross(
         Kcross = ggml_scale(ctx0, Kcross, Kscale);
 #endif
 
-        struct ggml_tensor * Vcross = ggml_mul_mat(ctx0,
+        struct ggml_tensor * Vcross = s2t_mul_mat(ctx0,
                 layer.cross_attn_v_w,
                 cur);
 
@@ -2607,7 +2628,7 @@ static struct ggml_cgraph * whisper_build_graph_decoder(
 
         // self-attention
         {
-            struct ggml_tensor * Qcur = ggml_mul_mat(ctx0,
+            struct ggml_tensor * Qcur = s2t_mul_mat(ctx0,
                     layer.attn_q_w,
                     cur);
 
@@ -2618,7 +2639,7 @@ static struct ggml_cgraph * whisper_build_graph_decoder(
             Qcur = ggml_scale(ctx0, Qcur, KQscale);
 
             // note: no bias for Key
-            struct ggml_tensor * Kcur = ggml_mul_mat(ctx0,
+            struct ggml_tensor * Kcur = s2t_mul_mat(ctx0,
                     layer.attn_k_w,
                     cur);
 
@@ -2626,7 +2647,7 @@ static struct ggml_cgraph * whisper_build_graph_decoder(
 
             // store key and value to memory
             {
-                struct ggml_tensor * Vcur = ggml_mul_mat(ctx0,
+                struct ggml_tensor * Vcur = s2t_mul_mat(ctx0,
                         layer.attn_v_w,
                         cur);
 
@@ -2685,7 +2706,7 @@ static struct ggml_cgraph * whisper_build_graph_decoder(
                 cur = ggml_reshape_2d(ctx0, cur, n_state, n_tokens);
             } else {
                 // K * Q
-                struct ggml_tensor * KQ = ggml_mul_mat(ctx0, K, Q);
+                struct ggml_tensor * KQ = s2t_mul_mat(ctx0, K, Q);
 
                 struct ggml_tensor * KQ_soft_max = ggml_soft_max_ext(ctx0, KQ, KQ_mask, 1.0f, 0.0f);
 
@@ -2696,7 +2717,7 @@ static struct ggml_cgraph * whisper_build_graph_decoder(
                             n_ctx*ggml_element_size(kv_self.v)*n_state_head,
                             n_ctx*ggml_element_size(kv_self.v)*n_state*il);
 
-                struct ggml_tensor * KQV = ggml_mul_mat(ctx0, V, KQ_soft_max);
+                struct ggml_tensor * KQV = s2t_mul_mat(ctx0, V, KQ_soft_max);
 
                 struct ggml_tensor * KQV_merged = ggml_permute(ctx0, KQV, 0, 2, 1, 3);
 
@@ -2706,7 +2727,7 @@ static struct ggml_cgraph * whisper_build_graph_decoder(
 
         // projection
         {
-            cur = ggml_mul_mat(ctx0,
+            cur = s2t_mul_mat(ctx0,
                     layer.attn_ln_1_w,
                     cur);
 
@@ -2732,7 +2753,7 @@ static struct ggml_cgraph * whisper_build_graph_decoder(
 
         // cross-attention
         {
-            struct ggml_tensor * Qcur = ggml_mul_mat(ctx0,
+            struct ggml_tensor * Qcur = s2t_mul_mat(ctx0,
                     layer.cross_attn_q_w,
                     cur);
 
@@ -2781,7 +2802,7 @@ static struct ggml_cgraph * whisper_build_graph_decoder(
                 // ------
 
                 // K * Q
-                struct ggml_tensor * KQ = ggml_mul_mat(ctx0, Kcross, Q);
+                struct ggml_tensor * KQ = s2t_mul_mat(ctx0, Kcross, Q);
 
                 struct ggml_tensor * KQ_soft_max = ggml_soft_max_ext(ctx0, KQ, nullptr, KQscale, 0.0f);
 
@@ -2791,7 +2812,7 @@ static struct ggml_cgraph * whisper_build_graph_decoder(
                         struct ggml_tensor * aheads_KQs = ggml_reshape_2d(ctx0, KQ_soft_max, KQ_soft_max->ne[0] * KQ_soft_max->ne[1], KQ_soft_max->ne[2]);
                         aheads_KQs = ggml_transpose(ctx0, aheads_KQs);
                         aheads_KQs = ggml_cont(ctx0, aheads_KQs);
-                        aheads_KQs = ggml_mul_mat(ctx0, wstate.aheads_masks.m[il], aheads_KQs);
+                        aheads_KQs = s2t_mul_mat(ctx0, wstate.aheads_masks.m[il], aheads_KQs);
                         aheads_KQs = ggml_transpose(ctx0, aheads_KQs);
                         aheads_KQs = ggml_cont(ctx0, aheads_KQs);
                         aheads_KQs = ggml_reshape_3d(ctx0, aheads_KQs, KQ_soft_max->ne[0], KQ_soft_max->ne[1], wstate.aheads_masks.m[il]->ne[1]);
@@ -2803,7 +2824,7 @@ static struct ggml_cgraph * whisper_build_graph_decoder(
                     }
                 }
 
-                struct ggml_tensor * KQV = ggml_mul_mat(ctx0, Vcross, KQ_soft_max);
+                struct ggml_tensor * KQV = s2t_mul_mat(ctx0, Vcross, KQ_soft_max);
 
                 struct ggml_tensor * KQV_merged = ggml_permute(ctx0, KQV, 0, 2, 1, 3);
 
@@ -2813,7 +2834,7 @@ static struct ggml_cgraph * whisper_build_graph_decoder(
 
         // projection
         {
-            cur = ggml_mul_mat(ctx0,
+            cur = s2t_mul_mat(ctx0,
                     layer.cross_attn_ln_1_w,
                     cur);
 
@@ -2842,7 +2863,7 @@ static struct ggml_cgraph * whisper_build_graph_decoder(
             }
 
             // fully connected
-            cur = ggml_mul_mat(ctx0,
+            cur = s2t_mul_mat(ctx0,
                     layer.mlp_0_w,
                     cur);
 
@@ -2854,7 +2875,7 @@ static struct ggml_cgraph * whisper_build_graph_decoder(
             cur = ggml_gelu_erf(ctx0, cur);
 
             // projection
-            cur = ggml_mul_mat(ctx0,
+            cur = s2t_mul_mat(ctx0,
                     layer.mlp_1_w,
                     cur);
 
@@ -2884,7 +2905,7 @@ static struct ggml_cgraph * whisper_build_graph_decoder(
     // might be useful in the future
     //cur = ggml_view_2d(ctx0, cur, cur->ne[0], 1, cur->nb[1], (cur->ne[1] - 1)*cur->nb[1]);
 
-    struct ggml_tensor * logits = ggml_mul_mat(ctx0, model.d_te, cur);
+    struct ggml_tensor * logits = s2t_mul_mat(ctx0, model.d_te, cur);
 
     // [EXPERIMENTAL] Token-level timestamps with DTW
     if (wctx.params.dtw_token_timestamps && aheads_cross_QKs != nullptr) {
