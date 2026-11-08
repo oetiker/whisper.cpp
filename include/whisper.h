@@ -765,6 +765,32 @@ extern "C" {
     // Get the no_speech probability for the specified segment
     WHISPER_API float whisper_full_get_segment_no_speech_prob           (struct whisper_context * ctx, int i_segment);
     WHISPER_API float whisper_full_get_segment_no_speech_prob_from_state(struct whisper_state * state, int i_segment);
+
+    // s2t: encoder output access for the swiss2text Rust driver
+
+    // Copy the encoder output of the last whisper_encode_with_state() or whisper_s2t_encode_from_embd()
+    // (after ln_post, n_audio_ctx x n_audio_state floats, row-major by frame) to dst.
+    // n must equal that size. Returns 0 on success
+    WHISPER_API int whisper_s2t_get_embd_enc(
+            struct whisper_context * ctx,
+              struct whisper_state * state,
+                             float * dst,
+                            size_t   n);
+
+    // Use embd (n_audio_ctx x n_audio_state floats, row-major by frame) as the encoder output:
+    // skips the conv and encoder graphs and computes only the cross-attention KV cache.
+    // n must equal that size. Returns 0 on success
+    WHISPER_API int whisper_s2t_encode_from_embd(
+            struct whisper_context * ctx,
+              struct whisper_state * state,
+                       const float * embd,
+                            size_t   n,
+                               int   n_threads);
+
+    // Name of the device the state computes on: the first of its backends that is not an ACCEL device
+    // (e.g. "CPU", "MTL0"). Returns NULL if there is none
+    WHISPER_API const char * whisper_s2t_backend_name(struct whisper_state * state);
+
 #ifdef __cplusplus
 }
 #endif

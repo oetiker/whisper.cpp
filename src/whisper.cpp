@@ -884,6 +884,11 @@ struct whisper_state {
     struct ggml_tensor * embd_conv = nullptr;
     struct ggml_tensor * embd_enc  = nullptr;
 
+    // s2t: encoder output supplied by whisper_s2t_encode_from_embd(), in its own buffer
+    struct ggml_context * s2t_embd_ctx = nullptr;
+    ggml_backend_buffer_t s2t_embd_buf = nullptr;
+    struct ggml_tensor *  s2t_embd     = nullptr;
+
     // helpers for GPU offloading
     std::vector<float> inp_mel;
     std::vector<float> inp_mask;
@@ -3957,6 +3962,9 @@ void whisper_free_state(struct whisper_state * state) {
 #endif
 
         whisper_batch_free(state->batch);
+
+        ggml_backend_buffer_free(state->s2t_embd_buf);
+        ggml_free(state->s2t_embd_ctx);
 
         ggml_backend_sched_free(state->sched_conv.sched);
         ggml_backend_sched_free(state->sched_encode.sched);
@@ -8356,6 +8364,158 @@ float whisper_full_get_segment_no_speech_prob(struct whisper_context * ctx, int 
 
 float whisper_full_get_segment_no_speech_prob_from_state(struct whisper_state * state, int i_segment) {
     return state->result_all[i_segment].no_speech_prob;
+}
+
+// =================================================================================================
+
+//
+// s2t: encoder output access for the swiss2text Rust driver
+//
+
+// the backend the state computes on: the first one that is not an ACCEL device (BLAS sits before CPU)
+static ggml_backend_t whisper_s2t_compute_backend(const whisper_state & state) {
+    for (ggml_backend_t backend : state.backends) {
+        ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+        if (dev != nullptr && ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_ACCEL) {
+            return backend;
+        }
+    }
+
+    return nullptr;
+}
+
+int whisper_s2t_get_embd_enc(struct whisper_context * ctx, struct whisper_state * state, float * dst, size_t n) {
+    if (ctx == nullptr || state == nullptr || dst == nullptr) {
+        WHISPER_LOG_ERROR("%s: null argument\n", __func__);
+        return -1;
+    }
+
+    if (state->n_encode == 0 || state->embd_enc == nullptr) {
+        WHISPER_LOG_ERROR("%s: no encoder output, call whisper_encode_with_state() first\n", __func__);
+        return -2;
+    }
+
+    const auto & hparams = ctx->model.hparams;
+
+    const int n_ctx   = state->exp_n_audio_ctx > 0 ? state->exp_n_audio_ctx : hparams.n_audio_ctx;
+    const int n_state = hparams.n_audio_state;
+
+    const struct ggml_tensor * embd = state->embd_enc;
+
+    if (embd->type != GGML_TYPE_F32 || embd->buffer == nullptr || embd->data == nullptr || !ggml_is_contiguous(embd) ||
+        embd->ne[0] != n_state || embd->ne[1] != n_ctx || ggml_nelements(embd) != (int64_t) n_ctx*n_state) {
+        WHISPER_LOG_ERROR("%s: the encoder output is not a %d x %d f32 tensor\n", __func__, n_ctx, n_state);
+        return -3;
+    }
+
+    if (n != (size_t) n_ctx*n_state) {
+        WHISPER_LOG_ERROR("%s: dst holds %zu floats, the encoder output %d\n", __func__, n, n_ctx*n_state);
+        return -4;
+    }
+
+    ggml_backend_tensor_get(embd, dst, 0, n*sizeof(float));
+
+    return 0;
+}
+
+int whisper_s2t_encode_from_embd(struct whisper_context * ctx, struct whisper_state * state, const float * embd, size_t n, int n_threads) {
+    if (ctx == nullptr || state == nullptr || embd == nullptr) {
+        WHISPER_LOG_ERROR("%s: null argument\n", __func__);
+        return -1;
+    }
+
+    const int64_t t_start_us = ggml_time_us();
+
+    const auto & hparams = ctx->model.hparams;
+
+    const int n_ctx   = state->exp_n_audio_ctx > 0 ? state->exp_n_audio_ctx : hparams.n_audio_ctx;
+    const int n_state = hparams.n_audio_state;
+
+    if (n != (size_t) n_ctx*n_state) {
+        WHISPER_LOG_ERROR("%s: embd holds %zu floats, expected %d x %d\n", __func__, n, n_ctx, n_state);
+        return -2;
+    }
+
+    // the tensor lives in its own buffer on the compute backend and is reused by later calls
+    if (state->s2t_embd != nullptr && state->s2t_embd->ne[1] != n_ctx) {
+        if (state->embd_enc == state->s2t_embd) {
+            state->embd_enc = nullptr;
+        }
+        ggml_backend_buffer_free(state->s2t_embd_buf);
+        ggml_free(state->s2t_embd_ctx);
+        state->s2t_embd_buf = nullptr;
+        state->s2t_embd_ctx = nullptr;
+        state->s2t_embd     = nullptr;
+    }
+
+    if (state->s2t_embd == nullptr) {
+        ggml_backend_t backend = whisper_s2t_compute_backend(*state);
+        if (backend == nullptr) {
+            WHISPER_LOG_ERROR("%s: the state has no compute backend\n", __func__);
+            return -3;
+        }
+
+        struct ggml_init_params params = {
+            /*.mem_size   =*/ ggml_tensor_overhead(),
+            /*.mem_buffer =*/ nullptr,
+            /*.no_alloc   =*/ true,
+        };
+
+        state->s2t_embd_ctx = ggml_init(params);
+        if (state->s2t_embd_ctx == nullptr) {
+            WHISPER_LOG_ERROR("%s: failed to create the ggml context\n", __func__);
+            return -4;
+        }
+
+        state->s2t_embd = ggml_new_tensor_2d(state->s2t_embd_ctx, GGML_TYPE_F32, n_state, n_ctx);
+        ggml_set_name(state->s2t_embd, "s2t_embd_enc");
+
+        state->s2t_embd_buf = ggml_backend_alloc_ctx_tensors(state->s2t_embd_ctx, backend);
+        if (state->s2t_embd_buf == nullptr) {
+            WHISPER_LOG_ERROR("%s: failed to allocate the encoder output buffer\n", __func__);
+            ggml_free(state->s2t_embd_ctx);
+            state->s2t_embd_ctx = nullptr;
+            state->s2t_embd     = nullptr;
+            return -5;
+        }
+    }
+
+    ggml_backend_tensor_set(state->s2t_embd, embd, 0, n*sizeof(float));
+
+    state->embd_enc = state->s2t_embd;
+
+    // cross
+    {
+        auto & sched = state->sched_cross.sched;
+
+        ggml_cgraph * gf = whisper_build_graph_cross(*ctx, *state);
+
+        if (!ggml_backend_sched_alloc_graph(sched, gf)) {
+            WHISPER_LOG_ERROR("%s: failed to allocate the cross graph\n", __func__);
+            ggml_backend_sched_reset(sched);
+            return -6;
+        }
+
+        if (!ggml_graph_compute_helper(sched, gf, n_threads)) {
+            WHISPER_LOG_ERROR("%s: failed to eval\n", __func__);
+            return -7;
+        }
+    }
+
+    state->t_encode_us += ggml_time_us() - t_start_us;
+    state->n_encode++;
+
+    return 0;
+}
+
+const char * whisper_s2t_backend_name(struct whisper_state * state) {
+    if (state == nullptr) {
+        return nullptr;
+    }
+
+    ggml_backend_t backend = whisper_s2t_compute_backend(*state);
+
+    return backend != nullptr ? ggml_backend_dev_name(ggml_backend_get_device(backend)) : nullptr;
 }
 
 // =================================================================================================
