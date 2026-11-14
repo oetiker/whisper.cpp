@@ -46,10 +46,16 @@
 
 // s2t: f32 precision in the whisper graph (the swiss2text fixtures are f32 mlx references)
 
-// every mul_mat of the whisper graph asks for src1 in f32: ggml-metal then runs an f32 x f32 product
-// as mul_mm_f32_f32_prec instead of staging both operands through half (the CPU backend ignores it)
+// every mul_mat of the whisper graph asks for
+// - an f32 accumulator (op_params[0]): ggml-cuda/HIP then runs an f16-weight product through cuBLAS
+//   with an f32 compute type and MMVF with float accumulation, and ggml-vulkan drops its f16acc
+//   mul_mm pipelines, instead of accumulating in f16 (ggml-metal always accumulates in float)
+// - src1 in f32 (op_params[3]): ggml-metal and ggml-vulkan then run an f32 x f32 product as
+//   mul_mm_f32_f32_prec / f32_stage instead of staging both operands through half
+// the CPU backend ignores both
 static struct ggml_tensor * s2t_mul_mat(struct ggml_context * ctx, struct ggml_tensor * a, struct ggml_tensor * b) {
     struct ggml_tensor * r = ggml_mul_mat(ctx, a, b);
+    ggml_prec_set_acc(r, GGML_PREC_F32);
     ggml_prec_set_src(r, GGML_PREC_F32, 1);
     return r;
 }
